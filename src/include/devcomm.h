@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #define NCCL_NUM_FUNCTIONS 5 // SendRecv not included for now
-typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv} ncclFunc_t;
+typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv, ncclNumFuncs} ncclFunc_t;
 extern const char* ncclFuncStr[NCCL_NUM_FUNCTIONS];
 
 #define NCCL_NUM_ALGORITHMS 3 // Tree/Ring/CollNet
@@ -69,10 +69,6 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 #define NCCL_LL128_MAX_NTHREADS 640
 #define NCCL_LL128_ELEMS_PER_THREAD 120
 
-// Receiving from up to 3 sources is more compute intensive than sending
-// to 3 dests. Use 70% for reduce and 30% for bcast.
-#define NCCL_LL128_SPLIT(nt) ((nt*7/(10*32))*32)
-
 #define NCCL_LL128_SHMEM_ELEMS_PER_THREAD 8
 #define NCCL_LL128_SHMEM_SIZE (NCCL_LL128_SHMEM_ELEMS_PER_THREAD*NCCL_LL128_MAX_NTHREADS)
 
@@ -99,8 +95,9 @@ struct ncclConnInfo {
 struct ncclConnector {
   int connected;
   struct ncclProxyArgs *proxyAppend;
+  struct ncclProxyArgs **proxyAppendPtr;
   struct ncclTransportComm* transportComm;
-  void* transportResources; // Host-side resources
+  void* transportResources;
   struct ncclConnInfo conn;
   struct ncclComm *comm;
 };
@@ -115,6 +112,8 @@ struct ncclRing {
   // devices. Ordered from current device.
   int* userRanks;
   int* devUserRanks;
+
+  int index; // This rank's index in the ring
 };
 
 
@@ -125,9 +124,21 @@ struct ncclTree {
   int down[NCCL_MAX_TREE_ARITY];
 };
 
+#define NCCL_MAX_DIRECT_ARITY 7
+struct ncclDirect {
+  int depth;
+  int out;
+  int nHeads;
+  int headRank;
+  int shift;
+  int up[NCCL_MAX_DIRECT_ARITY];
+  int down[NCCL_MAX_DIRECT_ARITY];
+};
+
+#define NCCL_MAX_CONNS 2
 struct ncclPeer {
-  struct ncclConnector send;
-  struct ncclConnector recv;
+  struct ncclConnector send[NCCL_MAX_CONNS];
+  struct ncclConnector recv[NCCL_MAX_CONNS];
 };
 
 struct ncclDevComm;
@@ -161,6 +172,8 @@ struct ncclWorkElem {
     struct {
       size_t sendCount;
       size_t recvCount;
+      int sendChunkSize;
+      int recvChunkSize;
       int32_t delta;
       uint16_t nThreads;
     } p2p;
@@ -177,7 +190,7 @@ struct ncclChannel {
     struct {
       struct ncclRing ring;
       struct ncclTree tree;
-      struct ncclTree collTree;
+      struct ncclDirect collTree;
 
       int id;
 
@@ -188,7 +201,14 @@ struct ncclChannel {
       // Operation list for aggregation
       struct ncclWork* workFifo;
       int workCount;
+      size_t totalSize;
       uint64_t workFifoTail; // Only used by CPU
+      uint16_t index;        // Only used by GPU
+
+      // GDRCOPY support
+      struct ncclWork* workFifoGdr;
+      struct ncclWork* workFifoDev;
+      void* gdrMemDesc;
     };
     int data[0x80];
   };
@@ -205,6 +225,11 @@ struct ncclDevComm {
 
   // Channels, device side
   struct ncclChannel* channels;
+};
+
+struct ncclDevCommAndChannels {
+  ncclDevComm comm;
+  ncclChannel channels[MAXCHANNELS];
 };
 
 #endif

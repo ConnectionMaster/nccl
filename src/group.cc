@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -125,7 +125,7 @@ static ncclResult_t scheduleSendRecv(struct ncclComm* comm, int delta, int chann
   info.sendbytes = sendbytes;
   info.recvbytes = recvbytes;
   if (delta == 0 && sendbytes != recvbytes) return ncclInvalidUsage;
-  NCCLCHECK(ncclSaveP2pKernel(&info));
+  NCCLCHECK(ncclSetupP2pKernel(&info));
   return ncclSuccess;
 }
 
@@ -133,7 +133,8 @@ void* ncclAsyncThreadPreconnect(void* args_) {
   struct ncclAsyncArgs* args = (struct ncclAsyncArgs*)args_;
   struct ncclComm* comm = args->coll.comm;
   CUDACHECKTHREAD(cudaSetDevice(comm->cudaDev));
-  NCCLCHECKTHREAD(ncclTransportP2pSetup(comm, NULL));
+  if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
+  NCCLCHECKTHREAD(ncclTransportP2pSetup(comm, NULL, 0));
   return args;
 }
 
@@ -163,6 +164,8 @@ ncclResult_t ncclGroupEnd() {
   int doneArray[MAX_ASYNC_OPS];
   for (int i=0; i<ncclGroupIndex; i++) doneArray[i] = 1;
   ncclResult_t ret = ncclGroupError;
+  int usingCudaGraphAll = -1;
+  cudaGraph_t* graphs = NULL;
   if (ret != ncclSuccess) goto group_cleanup;
 
   /* Launch async ncclCommInitRank */
@@ -201,7 +204,7 @@ ncclResult_t ncclGroupEnd() {
     if (args->funcType == ASYNC_FUNC_COLL && args->coll.comm->connect) {
       int err = pthread_join(ncclGroupThreads[i], NULL);
       if (err != 0) {
-        WARN("Error waiting for pthread_join : %s\n", strerror(errno));
+        WARN("Error waiting for pthread_join : %s", strerror(errno));
         return ncclSystemError;
       }
       NCCLCHECKGOTO(args->ret, ret, end);
@@ -215,8 +218,6 @@ ncclResult_t ncclGroupEnd() {
       struct ncclComm* comm = args->coll.comm;
       int rank = comm->rank;
       int nRanks = comm->nRanks;
-      struct ncclP2Plist* p2pSends = comm->p2pSends;
-      struct ncclP2Plist* p2pRecvs = comm->p2pRecvs;
 
       // Compute how much to split operations
       // Natural step size matching buffer steps.
@@ -233,14 +234,14 @@ ncclResult_t ncclGroupEnd() {
         // schedule delta 0, +1, -1, +2, -2, ...
         // also make sure we don't do 0 twice, nor +n/2 and -n/2 if n is even.
         for (int d=0; d<=nRanks/4; d++) {
-          int deltas[4] = { d, (nRanks-d)%nRanks, nRanks/2-d, nRanks-(nRanks/2-d) };
+          int deltas[4] = { d, (nRanks-d)%nRanks, nRanks/2-d, (nRanks-(nRanks/2-d))%nRanks };
           int index = 0;
           int delta = deltas[index];
 sched_delta:
           uint32_t from = (rank+nRanks-delta)%nRanks;
           uint32_t to = (rank+delta)%nRanks;
-          struct ncclP2Pinfo* recv = p2pRecvs[from].head;
-          struct ncclP2Pinfo* send = p2pSends[to].head;
+          struct ncclP2Pinfo* recv = comm->p2pRecvs[from] ? comm->p2pRecvs[from]->getNext() : NULL;
+          struct ncclP2Pinfo* send = comm->p2pSends[to] ? comm->p2pSends[to]->getNext() : NULL;
           if (recv != NULL || send != NULL) {
             ssize_t totRecvBytes = -1, totSendBytes = -1;
             if (recv != NULL) totRecvBytes = recv->nbytes;
@@ -258,6 +259,10 @@ sched_delta:
               ssize_t sendbytes = totSendBytes-sendOffset;
               if (recvbytes > recvChunkSize) { recvbytes = recvChunkSize; } else { recvRemaining = 0; }
               if (sendbytes > sendChunkSize) { sendbytes = sendChunkSize; } else { sendRemaining = 0; }
+              // 0-bytes send/recv are considered as syncs. Make sure we only add syncs when requested
+              // (total size == 0), otherwise set size to -1 so that the kernel skips the operation.
+              if (sendbytes == 0 && totSendBytes != 0) sendbytes = -1;
+              if (recvbytes == 0 && totRecvBytes != 0) recvbytes = -1;
               if (sendbytes >= 0 || recvbytes >= 0) {
                 NCCLCHECKGOTO(scheduleSendRecv(comm, delta, channelId,
                       recvbytes, recv ? ((char*)(recv->buff)) + recvOffset : NULL,
@@ -267,15 +272,11 @@ sched_delta:
               sendOffset += sendChunkSize;
               chunk++;
             } while (sendRemaining || recvRemaining);
-            if (recv) {
-              NCCLCHECKGOTO(dequeueP2pInfo(p2pRecvs+from), ret, group_cleanup);
-              comm->p2pRecvCount--;
-            }
-            if (send) {
-              NCCLCHECKGOTO(dequeueP2pInfo(p2pSends+to), ret, group_cleanup);
-              comm->p2pSendCount--;
-            }
+            if (recv) comm->p2pRecvCount--;
+            if (send) comm->p2pSendCount--;
           }
+          if (recv == NULL && comm->p2pRecvs[from]) comm->p2pRecvs[from]->recycle();
+          if (send == NULL && comm->p2pSends[to]) comm->p2pSends[to]->recycle();
           index++;
           if (index == 1 && deltas[1] == deltas[0]) index++;
           if (index == 2 && deltas[2] == deltas[0]) index++;
@@ -300,34 +301,61 @@ sched_delta:
    * prevent some ranks from launching their network threads, which would
    * prevent the NCCL call from completing, blocking the cudaFree call.
    */
+
+  // Check whether we are in cuda graph mode
+  NCCLCHECK(ncclCalloc(&graphs, ncclGroupIndex));
   for (int i=0; i<ncclGroupIndex; i++) {
     struct ncclAsyncArgs* args = ncclGroupArgs+i;
     if (args->funcType == ASYNC_FUNC_COLL) {
       ncclComm_t comm = args->coll.comm;
-      NCCLCHECKGOTO(ncclSaveCommKernels(comm), ret, group_cleanup);
+      NCCLCHECKGOTO(ncclGetCudaGraph(comm, graphs+i), ret, group_cleanup);
+      if (usingCudaGraphAll == -1) {
+        usingCudaGraphAll = comm->usingCudaGraph;
+      } else if (usingCudaGraphAll != comm->usingCudaGraph) {
+        WARN("Illegal to have some communicators in graph mode while others not");
+        ret = ncclInvalidUsage;
+        goto group_cleanup;
+      }
     }
   }
   for (int i=0; i<ncclGroupIndex; i++) {
     struct ncclAsyncArgs* args = ncclGroupArgs+i;
     if (args->funcType == ASYNC_FUNC_COLL) {
-      if (args->coll.comm->userStream == NULL)
+      ncclComm_t comm = args->coll.comm;
+      NCCLCHECKGOTO(ncclSetupAsyncKernels(comm), ret, group_cleanup);
+    }
+  }
+  for (int i=0; i<ncclGroupIndex; i++) {
+    struct ncclAsyncArgs* args = ncclGroupArgs+i;
+    if (args->funcType == ASYNC_FUNC_COLL) {
+      if (args->coll.comm->userStream == cudaStreamDefault ||
+          args->coll.comm->userStream == cudaStreamPerThread ||
+          args->coll.comm->userStream == cudaStreamLegacy)
         CUDACHECKGOTO(cudaSetDevice(args->coll.comm->cudaDev), ret, end);
-      NCCLCHECKGOTO(ncclBarrierEnqueue(args->coll.comm), ret, end);
+      if (usingCudaGraphAll == 1) {
+        NCCLCHECKGOTO(ncclCudaGraphHostSetup(args->coll.comm, graphs[i]), ret, end);
+      } else {
+        ncclEnqueueHostSetup<0>(args->coll.comm->enqueueInfo);
+      }
+      NCCLCHECKGOTO(ncclLaunchBarrier(args->coll.comm), ret, end);
     }
   }
   for (int i=0; i<ncclGroupIndex; i++) {
     struct ncclAsyncArgs* args = ncclGroupArgs+i;
     if (args->funcType == ASYNC_FUNC_COLL) {
       CUDACHECKGOTO(cudaSetDevice(args->coll.comm->cudaDev), ret, end);
-      NCCLCHECKGOTO(ncclBarrierEnqueueWait(args->coll.comm), ret, end);
+      NCCLCHECKGOTO(ncclLaunchKernel(args->coll.comm), ret, end);
     }
   }
   for (int i=0; i<ncclGroupIndex; i++) {
     struct ncclAsyncArgs* args = ncclGroupArgs+i;
     if (args->funcType == ASYNC_FUNC_COLL) {
-      if (args->coll.comm->userStream == NULL)
+      if (args->coll.comm->userStream == cudaStreamDefault ||
+          args->coll.comm->userStream == cudaStreamPerThread ||
+          args->coll.comm->userStream == cudaStreamLegacy)
         CUDACHECKGOTO(cudaSetDevice(args->coll.comm->cudaDev), ret, end);
-      NCCLCHECKGOTO(ncclEnqueueEvents(args->coll.comm), ret, end);
+      NCCLCHECKGOTO(ncclRecordEvents(args->coll.comm), ret, end);
+      NCCLCHECKGOTO(ncclLaunchReset(args->coll.comm), ret, end);
     }
   }
 
@@ -348,11 +376,9 @@ group_cleanup:
         comm->asyncTotalSize = 0;
         // Dequeue p2p lists
         if (comm->p2pSendCount > 0 || comm->p2pRecvCount > 0) {
-          struct ncclP2Plist* p2pSends = comm->p2pSends;
-          struct ncclP2Plist* p2pRecvs = comm->p2pRecvs;
           for (int peer=0; peer<comm->nRanks; peer++) {
-            while (p2pSends[peer].head != NULL) dequeueP2pInfo(p2pSends+peer);
-            while (p2pRecvs[peer].head != NULL) dequeueP2pInfo(p2pRecvs+peer);
+            if (comm->p2pSends[peer]) comm->p2pSends[peer]->recycle();
+            if (comm->p2pRecvs[peer]) comm->p2pRecvs[peer]->recycle();
           }
           comm->p2pSendCount = comm->p2pRecvCount = 0;
         }
@@ -366,8 +392,7 @@ group_cleanup:
 	pthread_mutex_unlock(&state->poolMutex);
         state->nextOps = NULL;
 
-        comm->myParams->gridDim.x = comm->myParams->blockDim.x = 0;
-        comm->userStreamSet = false;
+        ncclLaunchReset(comm);
       }
     }
   }
@@ -375,5 +400,6 @@ end:
   ncclGroupError = ncclSuccess;
   ncclGroupIndex = 0;
   CUDACHECK(cudaSetDevice(savedDev)); // do other clean-ups first before calling cudaSetDevice, because this call can fail too
+  if (graphs) free(graphs);
   return ret;
 }

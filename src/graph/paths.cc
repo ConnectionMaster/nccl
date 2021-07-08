@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -25,9 +25,11 @@ static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* 
       return ncclSuccess;
     }
   }
-  WARN("Could not find node of type %d id %lx\n", t, id);
+  WARN("Could not find node of type %d id %lx", t, id);
   return ncclInternalError;
 }
+
+NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
 
 static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
   if (baseNode->paths[baseNode->type] == NULL) {
@@ -63,7 +65,7 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
 
         // allow routing through a GPU only as 1 hop
         if (node != baseNode && node->type == GPU &&
-            (link->type != LINK_NVL || remNode->type != GPU || path->count > 1)) continue;
+            (ncclParamNvbDisable() || link->type != LINK_NVL || remNode->type != GPU || path->count > 1)) continue;
 
         if ((remPath->width == 0 || remPath->count > path->count) && remPath->width < width) {
           // Find reverse link
@@ -280,8 +282,7 @@ ncclResult_t ncclTopoCheckP2p(struct ncclTopoSystem* system, int64_t id1, int64_
   NCCLCHECK(ncclTopoCpuType(system, &arch, &vendor, &model));
   if (arch == NCCL_TOPO_CPU_ARCH_ARM) p2pLevel = PATH_PXB;
   if (arch == NCCL_TOPO_CPU_ARCH_X86 && vendor == NCCL_TOPO_CPU_VENDOR_INTEL) {
-    if (model == NCCL_TOPO_CPU_TYPE_BDW) p2pLevel = PATH_PXB;
-    else p2pLevel = PATH_PHB;
+    p2pLevel = PATH_PXB;
   }
   if (arch == NCCL_TOPO_CPU_ARCH_X86 && vendor == NCCL_TOPO_CPU_VENDOR_ZHAOXIN) {
     p2pLevel = PATH_PXB;
@@ -387,7 +388,9 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclPeer
       struct ncclPeerInfo* srcInfo = peerInfos+system->nodes[GPU].nodes[p].gpu.rank;
       int shm;
       NCCLCHECK(ncclTransports[TRANSPORT_SHM].canConnect(&shm, system, NULL, srcInfo, dstInfo));
-      if (shm == 0) {
+      int p2p;
+      NCCLCHECK(ncclTransports[TRANSPORT_P2P].canConnect(&p2p, system, NULL, srcInfo, dstInfo));
+      if (shm == 0 && p2p == 0) {
         // Mark this peer as inaccessible. We'll trim it later.
         system->nodes[GPU].nodes[p].paths[GPU][g].count = 0;
       }
@@ -528,5 +531,22 @@ ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
     comm->p2pChannels[c] = mirror;
   }
   INFO(NCCL_INIT, "%d coll channels, %d p2p channels, %d p2p channels per peer", comm->nChannels, comm->p2pnChannels, comm->p2pnChannelsPerPeer);
+  return ncclSuccess;
+}
+
+ncclResult_t ncclTopoGetNvbGpus(struct ncclTopoSystem* system, int rank, int* nranks, int** ranks) {
+  int ngpus = system->nodes[GPU].count;
+  NCCLCHECK(ncclCalloc(ranks, ngpus));
+  int nvbGpus = 0;
+  for (int g=0; g<ngpus; g++) {
+    struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
+    if (gpu->gpu.rank != rank) continue;
+    for (int p=0; p<ngpus; p++) {
+      if (gpu->paths[GPU][p].type == PATH_NVB) {
+        (*ranks)[nvbGpus++] = system->nodes[GPU].nodes[p].gpu.rank;
+      }
+    }
+  }
+  *nranks = nvbGpus;
   return ncclSuccess;
 }
